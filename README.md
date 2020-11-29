@@ -1,7 +1,7 @@
 # Chaos Engineering: Site reliability through controlled disruption
 
 {% hint style='info' %}
-**本书仅作为学习、了解、推广Chaos Engineering而摘录，仅可用于个人学习。**
+**本书仅作为学习、了解、推广Chaos Engineering而摘录，仅可用于个人学习。本书的前9章可以[点击PDF链接](/shares/Chaos-Engineering.pdf)下载。**
 
 **您不可以在网络、论坛以及各类社交媒体分享、传播该链接。**
 
