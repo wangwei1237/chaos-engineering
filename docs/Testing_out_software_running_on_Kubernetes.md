@@ -520,4 +520,326 @@ A convenient way of doing that is to deploy a copy of Goldpinger that we can mod
 
 Let’s iron out some details. Goldpinger’s default timeout for all calls is 300ms, so let’s pick an arbitrary value of 250ms for our delay: enough to be clearly seen, but not enough to cause a timeout. And thanks to the built-in heatmap, we will be able to visually show the connections that take longer than others, so the observability aspect is taken care of. The plan of the experiment figuratively writes itself:
 
-# TODO
+1. Observability: use Goldpinger UI to read delays using the graph UI and the heatmap
+2. Steady state: all existing Goldpinger instantes report healthy
+3. Hypothesis: if we add a new instance that has a 250ms delay, the connectivity graph will show all four instances healthy, and the 250ms delay will be visible in the heatmap
+4. Run the experiment!
+
+Sounds good? Let’s see how to implement it.
+
+### Experiment 2: implementation
+Time to dig into what the implementation will look like. Do you remember figure 10.4 that showed how Goldpinger worked? Let me copy it for your convenience in figure 10.12. Every instance asks Kubernetes for all its peers, and then periodically makes calls to them to measure latency and detect problems.
+
+Figure 10.12 Overview of how Goldpinger works (again)
+
+![](../images/10.12.jpg)
+
+Now, what we want to do is add a copy of the Goldpinger pod that has the extra proxy we just discussed in front of it. A pod in Kubernetes can have multiple containers running alongside each other and able to communicate via localhost. If we use the same label `app=goldpinger`, the other instances will detect the new pod and start calling. But we will configure the ports in a way that instead of directly reaching the new instance, the peers will first reach the proxy (in port 8080). And the proxy will add the desired latency. The extra Goldpinger instance will be able to ping the other hosts freely, like a regular instance. This is summarized in figure 10.13.
+
+Figure 10.13 A modified copy of Goldpinger with an extra proxy in front of it
+
+![](../images/10.13.jpg)
+
+We’ve got the idea of what the setup will look like, now we need the actual networking proxy. Goldpinger communicates via HTTP/1.1, so we’re in luck. It’s a text-based, reasonably simple protocol running on top of TCP. All we need is the protocol specification (RFC 7230[^1], RFC 7231[^2], RFC 7232[^3], RFC 7233[^4] and RFC 7234[^5]) and we should be able to implement a quick proxy in no time. Dust off your C compiler, stretch your arms, and let’s do it!
+
+### Experiment 2: Toxiproxy
+Just kidding! We’ll use an existing, open-source project designed for this kind of thing, called Toxiproxy (https://github.com/shopify/toxiproxy). It works as a proxy on TCP level (L4 OSI model), which is fine for us, because we don’t actually need to understand anything about what’s going on on the HTTP level (L7) to introduce a simple latency. The added benefit is that you can use the same tool for any other TCP-based protocol in the exact same way, so what we’re about to do will be equally applicable to a lot of other popular software, like Redis, MySQL, PostgreSQL and many more.
+
+ToxiProxy consists of two pieces:
+
+* the actual proxy server, which exposes an API you can use to configure what should be proxied where and the kind of failure that you expect
+* and a CLI client, that connects to that API and can change the configuration live
+
+{% hint style='info' %}
+**NOTE CLI AND API**
+
+Instead of using the CLI, you can also talk to the API directly, and ToxiProxy offers ready-to-use clients in a variety of languages.
+{% endhint %}
+
+The dynamic nature of ToxiProxy makes it really useful when used in unit and integration testing. For example, your integration test could start by configuring the proxy to add latency when connecting to a database, and then your test could verify that timeouts are triggered accordingly. It’s also going to be handy for us in implementing our experiment.
+
+The version we’ll use, 2.1.4 (https://github.com/Shopify/toxiproxy/releases/tag/v2.1.4), is the latest available release at the time of writing. We’re going to run the proxy server as part of the extra Goldpinger pod using a prebuilt, publicly available image from Docker Hub. We’ll also need to use the CLI locally on your machine. To install it, download the CLI executable for your system (Ubuntu/Debian, Windows, MacOS) from https://github.com/Shopify/toxiproxy/releases/tag/v2.1.4 and add it to your PATH. To confirm it works, run the following command:
+
+```
+toxiproxy-cli –version
+```
+
+You should see the version 2.1.4 displayed, like in the following output:
+
+```
+toxiproxy-cli version 2.1.4
+```
+
+When a ToxiProxy server starts, by default it doesn’t do anything apart from running its HTTP API. By calling the API, you can configure and dynamically change the behavior of the proxy server. You can define arbitrary configurations defined by:
+
+1. a unique name
+2. a host and port to bind to and listen for connections
+3. a destination server to proxy to
+
+For every configuration like this, you can attach failures. In ToxiProxy lingo, these failures are called “toxics”. Currently, the following toxics are available:
+
+1. latency - add arbitrary latency to the connection (in either direction)
+2. down - take the connection down
+3. bandwidth - throttle the connection to the desired speed
+4. slow close - delay the TCP socket from closing for an arbitrary time
+5. timeout - wait for an arbitrary time and then close the connection
+6. slicer - slices the received data into smaller bits before sending it to the destination
+
+You can attach an arbitrary combination of failures to every proxy configuration you define. For our needs, the latency toxic will do exactly what we want it to. Let’s see how all of this fits together.
+
+{% hint style='info' %}
+**NOTE POP QUIZ: WHAT’S TOXIPROXY?**
+
+Pick one:
+
+1. A configurable TCP proxy, that can simulate various problems, like dropped packets or network slowness
+2. A K-pop band singing about the environmental consequences of dumping large amounts of toxic waste sent to third world countries through the use of proxy and shell companies
+
+See appendix B for answers.
+{% endhint %}
+
+### Experiment 2: implementation continued
+To sum it all up, we want to create a new pod with two containers: one for Goldpinger and one for the ToxiProxy. We’ll need to configure Goldpinger to run on a different port, so that the proxy can listen on the default port 8080 that the other Goldpinger instances will try to connect to. We’ll also create a service that routes connections to the proxy API on port 8474, so that we can use toxiproxy-cli commands to configure the proxy and add the latency that we want,just like in figure 10.14.
+
+Figure 10.14 Interacting with the modified version of Goldpinger using toxiproxy-cli
+
+![](../images/10.14.jpg)
+
+Let’s now translate this into a Kubernetes .yml file. You can see the resulting goldpinger-chaos.yml in listing 10.4. You will see two resource descriptions, a pod (with two containers) and a service. Note, that we use the same service account we created before, to give Goldpinger the same permissions. We’re also using two environment variables, `PORT` and `CLIENT_PORT_OVERRIDE`, to make Goldpinger listen on port 9090, but call its peers on port 8080, respectively. This is because by default, Goldpinger calls its peers on the same port that it runs itself. Finally, notice that the service is using a label `chaos=absolutely` to match to the new pod we created. It’s important that the Goldpinger pod has the label `app=goldpinger`, so that it can be found by its peers, but we also need another label to be able to route connections to the proxy API.
+
+```yaml
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: goldpinger-chaos
+  namespace: default
+  labels:
+    app: goldpinger                                #A
+    chaos: absolutely
+spec:
+  serviceAccount: "goldpinger-serviceaccount"      #B
+  containers:
+  - name: goldpinger
+    image: docker.io/bloomberg/goldpinger:v3.0.0
+    env:
+    - name: REFRESH_INTERVAL
+      value: "2"
+    - name: HOST
+      value: "0.0.0.0"
+    - name: PORT
+      value: "9090"                               #C
+    - name: CLIENT_PORT_OVERRIDE
+      value: "8080"
+    - name: POD_IP
+      valueFrom:
+        fieldRef:
+          fieldPath: status.podIP
+  - name: toxiproxy
+    image: docker.io/shopify/toxiproxy:2.1.4
+    ports:
+    - containerPort: 8474                         #D
+      name: toxiproxy-api
+    - containerPort: 8080
+      name: goldpinger
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: goldpinger-chaos
+  namespace: default
+spec:
+  type: LoadBalancer
+  ports:
+    - port: 8474                                  #E
+      name: toxiproxy-api
+  selector:
+    chaos: absolutely                             #F
+```
+
+\#A the new pod has the same label app=goldpinger to be detected by its peers, but also chaos=absolutely to be matched by the proxy api service
+
+\#B we use the same service account as other instances to give Goldpinger permission to list its peers
+
+\#C we use HOST envvar to make Goldpinger listen on port 9090, and CLIENT_PORT_OVERRIDE to make it call itse peers on the default port 8080
+
+\#D ToxiProxy container will expose two ports: 8474 with the ToxiProxy API and 8080 to proxy through to Goldpinger
+
+\#E the service will route traffic to port 8474 (ToxiProxy API)
+
+\#F the service will use label chaos=absolutely to select the pods running ToxiProxy
+
+And that’s all we need. Make sure you have this file handy (or clone it from the repo like before). Ready to rock? Let the games begin!
+
+### Experiment 2: run!
+To run this experiment, we’re going to use the Goldpinger UI. If you closed the browser window before, restart it by running the following command in the terminal:
+
+```
+minikube service goldpinger
+```
+
+Let’s start with the steady state, and confirm that all three nodes are visible and report as healthy. In the top bar, click Heatmap. You will see a heatmap similar to the one in figure 10.15. Each square represents connectivity between nodes and is color-coded based on the time it took to execute a request.
+
+* Columns represent source (from)
+* Rows represent destinations (to)
+* The legend clarifies which number corresponds to which pod.
+
+In this example, all squares are the same color and shade, meaning that all requests took below 2ms, which is to be expected when all instances run on the same host. You can also tweak the values to your liking and click “refresh” to show a new heatmap. Close it when you’re ready.
+
+Figure 10.15 Example of Goldpinger Heatmap
+
+![](../images/10.15.jpg)
+
+Let’s introduce our new pod! To do that, we’ll `kubectl apply` the goldpinger-chaos.yml file from listing 10.4. Run the following command:
+
+```
+kubectl apply -f goldpinger-chaos.yml
+```
+
+You will see an output confirming creation of a pod and service:
+
+```
+pod/goldpinger-chaos created
+service/goldpinger-chaos created
+```
+
+Let’s confirm it’s running by going to the UI. You will now see an extra node, just like in figure 10.16. But notice that the new pod is marked as unhealthy - all of its peers are failing to connect to it. In the live UI, the node is marked in red, and in the figure 10.16 I annotated the new, unhealthy node for you. This is because we haven’t configured the proxy to pass the traffic yet.
+
+Figure 10.16 Extra Goldpinger instance, detected by its peers, but inaccessible
+
+![](../images/10.16.jpg)
+
+Let’s address that by configuring the ToxiProxy. This is where the extra service we deployed comes in handy: we will use it to connect to the ToxiProxy API using toxiproxy-cli. Do you remember how we used `minikube service` to get a special URL to access the Goldpinger service? We’ll leverage that again, but this time with the `--url` flag, to only print the url itself. Run the following command in a bash session to store the url in a variable:
+
+```
+TOXIPROXY_URL=$(minikube service --url goldpinger-chaos)
+```
+
+We can now use the variable to point toxiproxy-cli to the right ToxiProxy API. That’s done using the -h flag. Confusingly, -h is not for “help”, it’s for “host”. Let’s confirm it works by listing the existing proxy configuration:
+
+```
+toxiproxy-cli -h $TOXIPROXY_URL list
+```
+
+You will see the following output, saying there are no proxies configured. It even goes so far as to hint we create some proxies (bold font):
+
+```
+Name       Listen          Upstream                Enabled         Toxics
+no proxies
+ 
+Hint: create a proxy with `toxiproxy-cli create`
+```
+
+Let’s configure one. We’ll call it chaos, make it route to localhost:9090 (where we configured Goldpinger to listen to) and listen on 0.0.0.0:8080 to make it accessible to its peers to call. Run the following command to make that happen:
+
+```
+toxiproxy-cli \ 
+  -h $TOXIPROXY_URL \        #A
+  create chaos \             #B
+  -l 0.0.0.0:8080 \          #C
+  -u localhost:9090          #D
+```
+
+\#A connect to specific proxy
+
+\#B create a new proxy configuration called “chaos”
+
+\#C listen on 0.0.0.0:8080 (default Goldpinger port)
+
+\#D relay connections to localhost:9090 (where we configured Goldpinger to run)
+
+You will see a simple confirmation that the proxy was created:
+
+```
+Created new proxy chaos
+```
+
+Rerun the `toxiproxy-cli list` command to see the new proxy appear this time:
+
+```
+toxiproxy-cli -h $TOXIPROXY_URL list
+```
+
+You will see the following output, listing a new proxy configuration called “chaos” (bold font):
+
+```
+Name       Listen          Upstream                Enabled         Toxics 
+  ================================================ 
+  chaos      [::]:8080       localhost:9090          enabled         None 
+  
+Hint: inspect toxics with `toxiproxy-cli inspect <proxyName>`
+```
+
+If you go back to the UI and click refresh, you will see that the `goldpinger-chaos` extra instance is now green, and all instances happily report healthy state in all directions. If you check the heatmap, it will also show all green.
+
+Let’s change that. Using the command `toxiproxy-cli toxic add`, let’s add a single toxic with 250ms latency. Do that by running the following command:
+
+```
+toxiproxy-cli \
+-h $TOXIPROXY_URL \
+toxic add \                  #A
+--type latency \             #B
+--a latency=250 \            #C
+--upstream \                 #D
+chaos                        #E
+```
+
+\#A add a toxic to an existing proxy configuration
+
+\#B toxic type is latency
+
+\#C we want to add 250ms of latency
+
+\#D we set it in the upstream direction, towards the Goldpinger instance
+
+\#E we attach this toxic to a proxy configuration called “chaos”
+
+You will see a confirmation:
+
+```
+Added upstream latency toxic 'latency_upstream' on proxy 'chaos'
+To confirm that the proxy got it right, we can inspect our proxy called “chaos”. To do that, run the following command:
+toxiproxy-cli -h $TOXIPROXY_URL inspect chaos
+```
+
+You will see an output just like the following, listing our brand new toxic (bold font):
+
+```
+Name: chaos     Listen: [::]:8080       Upstream: localhost:9090 
+  ====================================================================== 
+  Upstream toxics: 
+  latency_upstream:       type=latency    stream=upstream toxicity=1.00   attributes=[    jitter=0        latency=250     ] 
+  
+  Downstream toxics: 
+  Proxy has no Downstream toxics enabled.
+```
+
+Now, go back to the Goldpinger UI in the browser and refresh. You will still see all four instances reporting healthy and happy (the 250ms delay fits within the default timeout of 300ms). But if you open the heatmap, this time it will tell a different story. The row with `goldpinger-chaos` pod will be marked in red (problem threshold), implying that all its peers detected slowness. See figure 10.17 for a screenshot.
+
+Figure 10.17 Goldpinger heatmap, showing slowness accessing pod goldpinger-chaos
+
+![](../images/10.17.jpg)
+
+This means that our hypothesis was correct: Goldpinger correctly detects and reports the slowness, and at 250ms, below the default timeout of 300ms, the Goldpinger graph UI reports all as healthy. And we did all of that without modifying the existing pods.
+
+This wraps up the experiment, but before we go, let’s clean up the extra pod. To do that, run the following command to delete everything we created using the goldpinger-chaos.yml file:
+
+```
+kubectl delete -f goldpinger-chaos.yml
+```
+
+Let’s discuss our findings.
+
+### Experiment 2: Discussion
+How well did we do? We took some time to learn new tools, but the entire implementation of the experiment boiled down to a single .yml file and a handful of commands with ToxiProxy. We also had a tangible benefit of working on a copy of the software that we wanted to test, leaving the existing running processes unmodified. We effectively rolled out some extra capacity and then had 25% of running software affected, limiting the blast radius. Does it mean we could do that in production? As with any sufficiently complex question, the answer is, “it depends.” In this example, if we wanted to verify the robustness of some alerting that relies on metrics from Goldpinger to trigger, this could be a good way to do it. But the extra software could also affect the existing instances in a more profound way, making it more risky. At the end of the day, it really depends on your application.
+
+There is, of course, room for improvement. For example, the service we’re using to access the Goldpinger UI is routing traffic to any instance matched in a pseudo-random fashion. That means that sometimes it will route to the instance that has the 250ms delay. In our case, that will be difficult to spot with the naked eye, but if you wanted to test a larger delay, it could be a problem.
+
+Time to wrap up this first part. Coming in part 2: making your chaos engineer life easier with PowerfulSeal.
+
+---
+[^1]: https://tools.ietf.org/html/rfc7230
+[^2]: https://tools.ietf.org/html/rfc7231
+[^3]: https://tools.ietf.org/html/rfc7232
+[^4]: https://tools.ietf.org/html/rfc7233
+[^5]: https://tools.ietf.org/html/rfc7234
