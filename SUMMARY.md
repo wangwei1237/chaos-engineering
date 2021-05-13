@@ -15,5 +15,13 @@
     * [11.3 Cloud layer](docs/Cloud_layer.md)
     * [11.4 Summary](docs/Summary_11.md)
 * [12 Under the hood of Kubernetes](docs/Under_the_hood_of_Kubernetes.md)
+    * [12.1 Anatomy of a Kubernetes cluster and how to break it](docs/Anatomy_of_a_Kubernetes_cluster_and_how_to_break_it.md)
+    * [12.2 Summary of key components](docs/Summary_of_key_components.md)
+    * [12.3 Summary](docs/Summary_12.md)
 * [13 Chaos engineering (for) people](docs/Chaos_engineering_for_people.md)
+    * [13.1 Chaos engineering mindset](docs/Chaos_engineering_mindset.md)
+    * [13.2 Getting the buy-in](docs/Getting_the_buy_in.md)
+    * [13.3 Teams as distributed systems](docs/Teams_as_distributed_systems.md)
+    * [13.4 Summary](docs/Summary_13.md)
+    * [13.5 Where to go from here](docs/Where_to_go_from_here.md)
 
